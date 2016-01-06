@@ -1,6 +1,6 @@
 # For multiple programs using a single source file each,
 # we can just define 'progs' and create custom targets.
-PROGS	=	pkt-gen bridge vale-ctl
+PROGS	=	pkt-gen bridge vale-ctl pkt-gen-b bridge-b
 #PROGS += pingd
 PROGS	+= testlock test_select testmmap vale-ctl
 MORE_PROGS = kern_test
@@ -28,8 +28,20 @@ kern_test: testmod/kern_test.c
 pkt-gen: pkt-gen.o
 	$(CC) $(CFLAGS) -o pkt-gen pkt-gen.o $(LDFLAGS)
 
+pkt-gen-b: pkt-gen-b.o
+	$(CC) $(CFLAGS) -o pkt-gen-b pkt-gen-b.o $(LDFLAGS)
+
+pkt-gen-b.o: pkt-gen.c
+	$(CC) $(CFLAGS) -DBUSYWAIT -c pkt-gen.c -o pkt-gen-b.o
+
 bridge: bridge.o
 	$(CC) $(CFLAGS) -o bridge bridge.o
+	
+bridge-b: bridge-b.o
+	$(CC) $(CFLAGS) -o bridge-b bridge-b.o
+
+bridge-b.o: bridge.c
+	$(CC) $(CFLAGS) -DBUSYWAIT -c bridge.c -o bridge-b.o	
 
 vale-ctl: vale-ctl.o
 	$(CC) $(CFLAGS) -o vale-ctl vale-ctl.o

@@ -34,7 +34,6 @@
 
 /* a set of headers used in netmap */
 #include <linux/version.h>
-#include <linux/compiler.h>	// ACCESS_ONCE()
 
 #include <linux/if.h>
 #include <linux/list.h>
@@ -54,6 +53,7 @@
 #include <net/sock.h>
 #include <linux/delay.h>	// msleep
 #include <linux/skbuff.h>		// skb_copy_to_linear_data_offset
+#include <linux/vmalloc.h>
 
 #include <linux/io.h>	// virt_to_phys
 #include <linux/hrtimer.h>
@@ -78,10 +78,6 @@
 #define skb_copy_to_linear_data(skb, from, copy)		\
 	memcpy((skb)->data, from, copy)
 #endif /* HAVE_SKB_COPY_LINEAR */
-
-#ifndef NETMAP_LINUX_HAVE_ACCESS_ONCE
-#define ACCESS_ONCE(x)	(x)
-#endif
 
 #ifndef NETMAP_LINUX_HAVE_UINTPTR
 #define uintptr_t	unsigned long
@@ -132,6 +128,10 @@ struct net_device_ops {
 			atomic_set(&(page)[i_]._count, 1);\
 	} while (0)
 #endif /* HAVE_SPLIT_PAGE */
+
+#ifndef NETMAP_LINUX_HAVE_NNITD
+#define netdev_notifier_info_to_dev(ptr)	(ptr)
+#endif /* HAVE_NNITD */
 
 /*----------- end of LINUX_VERSION_CODE dependencies ----------*/
 
@@ -190,8 +190,8 @@ struct thread;
 #define	m_nextpkt		next			// chain of mbufs
 #define m_freem(m)		dev_kfree_skb_any(m)	// free a sk_buff
 
-#define GET_MBUF_REFCNT(m)	NM_ATOMIC_READ(&((m)->users))
-#define netmap_get_mbuf(size)	alloc_skb(size, GFP_ATOMIC)
+#define MBUF_REFCNT(m)			NM_ATOMIC_READ(&((m)->users))
+#define nm_os_get_mbuf(ifp, size)	alloc_skb(size, GFP_ATOMIC)
 /*
  * on tx we force skb->queue_mapping = ring_nr,
  * but on rx it is the driver that sets the value,
@@ -199,13 +199,17 @@ struct thread;
  */
 #define MBUF_TXQ(m)		skb_get_queue_mapping(m)
 #define MBUF_RXQ(m)		(skb_rx_queue_recorded(m) ? skb_get_rx_queue(m) : 0)
-#define SET_MBUF_DESTRUCTOR(m, f) m->destructor = (void *)&f
+#define SET_MBUF_DESTRUCTOR(m, f) m->destructor = (void *)f
 
 /* Magic number for sk_buff.priority field, used to take decisions in
- * generic_ndo_start_xmit() and in linux_generic_rx_handler().
+ * generic_ndo_start_xmit(), linux_generic_rx_handler() and
+ * generic_qdisc_dequeue().
  */
-#define NM_MAGIC_PRIORITY_TX 0xad86d310U
-#define NM_MAGIC_PRIORITY_RX 0xad86d311U
+#define NM_MAGIC_PRIORITY_TX	0xad86d310U
+#define NM_MAGIC_PRIORITY_TXQE	0xad86d311U
+#define NM_MAGIC_PRIORITY_RX	0xad86d30fU
+
+#define MBUF_QUEUED(m)		((m->priority & (~0x1)) == NM_MAGIC_PRIORITY_TX)
 
 /*
  * m_copydata() copies from mbuf to buffer following the mbuf chain.
@@ -249,9 +253,6 @@ int linux_netmap_set_ringparam(struct net_device *, struct ethtool_ringparam *);
 #ifdef NETMAP_LINUX_HAVE_SET_CHANNELS
 int linux_netmap_set_channels(struct net_device *, struct ethtool_channels *);
 #endif
-
-#define CURVNET_SET(x)
-#define CURVNET_RESTORE(x)
 
 #define refcount_acquire(_a)    atomic_add(1, (atomic_t *)_a)
 #define refcount_release(_a)    atomic_dec_and_test((atomic_t *)_a)
@@ -300,9 +301,15 @@ static inline void mtx_unlock(safe_spinlock_t *m)
 #define BDG_GET_VAR(lval)	(lval)
 #define BDG_FREE(p)		kfree(p)
 
+/*
+ * in the malloc/free code we ignore the type
+ */
 /* use volatile to fix a probable compiler error on 2.6.25 */
 #define malloc(_size, type, flags)                      \
         ({ volatile int _v = _size; kmalloc(_v, GFP_ATOMIC | __GFP_ZERO); })
+
+#define realloc(addr, _size, type, flags)		\
+	({ volatile int _v = _size; krealloc(addr, _v, GFP_ATOMIC | __GFP_ZERO); })
 
 #define free(a, t)	kfree(a)
 
@@ -341,10 +348,8 @@ static inline int ilog2(uint64_t n)
 #define vtophys		virt_to_phys
 
 /*--- selrecord and friends ---*/
-/* We use wake_up_interruptible() since select() and poll()
- * sleep in an interruptbile way. */
-#define	OS_selwakeup(sw, pri)	wake_up_interruptible(sw)
-#define OS_selrecord(x, y)		poll_wait((struct file *)x, y, pwait)
+struct nm_linux_selrecord_t;
+#define NM_SELRECORD_T	struct nm_linux_selrecord_t
 
 #define netmap_knlist_destroy(x)	// XXX todo
 
@@ -443,19 +448,6 @@ int sysctl_handle_long(SYSCTL_HANDLER_ARGS);
 #define MALLOC_DECLARE(a)
 #define MALLOC_DEFINE(a, b, c)
 
-#define devfs_get_cdevpriv(pp)				\
-	({ *(struct netmap_priv_d **)pp = ((struct file *)td)->private_data; 	\
-		(*pp ? 0 : ENOENT); })
-
-/* devfs_set_cdevpriv cannot fail on linux */
-#define devfs_set_cdevpriv(p, fn)				\
-	({ ((struct file *)td)->private_data = p; (p ? 0 : EINVAL); })
-
-
-#define devfs_clear_cdevpriv()	do {				\
-		netmap_dtor(priv); ((struct file *)td)->private_data = 0;	\
-	} while (0)
-
 struct netmap_adapter;
 int netmap_linux_config(struct netmap_adapter *na, 
 		u_int *txr, u_int *rxr, u_int *txd, u_int *rxd);
@@ -465,6 +457,11 @@ int netmap_bns_register(void);
 void netmap_bns_unregister(void);
 #define NM_BNS_GET(b)	(b)->ns = netmap_bns_get()
 #define NM_BNS_PUT(b)	netmap_bns_put(b->ns)
+#else
+#define NM_BNS_GET(b)	do { (void)(b); } while (0)
+#define NM_BNS_PUT(b)   do { (void)(b); } while (0)
 #endif
+
+#define if_printf(ifp, fmt, ...)  dev_info(&(ifp)->dev, fmt, ##__VA_ARGS__)
 
 #endif /* _BSD_GLUE_H */

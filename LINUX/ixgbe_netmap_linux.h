@@ -88,7 +88,6 @@ ixgbe_netmap_reg(struct netmap_adapter *na, int onoff)
 	while (test_and_set_bit(__IXGBE_RESETTING, &adapter->state))
 		usleep_range(1000, 2000);
 
-	rtnl_lock();
 	if (netif_running(adapter->netdev))
 		ixgbe_down(adapter);
 
@@ -101,12 +100,26 @@ ixgbe_netmap_reg(struct netmap_adapter *na, int onoff)
 	/* XXX SRIOV migth need another 2sec wait */
 	if (netif_running(adapter->netdev))
 		ixgbe_up(adapter);	/* also enables intr */
-	rtnl_unlock();
-
 	clear_bit(__IXGBE_RESETTING, &adapter->state);
 	return (0);
 }
 
+static inline void ixgbe_irq_enable_queues(struct ixgbe_adapter *adapter,
+						u64 qmask);
+static inline void ixgbe_irq_disable_queues(struct ixgbe_adapter *adapter,
+						u64 qmask);
+static void
+ixgbe_netmap_intr(struct netmap_adapter *na, int onoff)
+{
+	struct ifnet *ifp = na->ifp;
+	struct SOFTC_T *adapter = netdev_priv(ifp);
+
+	if (onoff) {
+		ixgbe_irq_enable_queues(adapter, ~0);
+	} else {
+		ixgbe_irq_disable_queues(adapter, ~0);
+	}
+}
 
 /*
  * Reconcile kernel and user view of the transmit ring.
@@ -207,14 +220,16 @@ ixgbe_netmap_txsync(struct netmap_kring *kring, int flags)
 				/* buffer has changed, reload map */
 				// netmap_reload_map(pdev, DMA_TO_DEVICE, old_addr, addr);
 			}
-			slot->flags &= ~(NS_REPORT | NS_BUF_CHANGED);
+			if (!(slot->flags & NS_MOREFRAG))
+				flags |= IXGBE_TXD_CMD_EOP;
+			slot->flags &= ~(NS_REPORT | NS_BUF_CHANGED | NS_MOREFRAG);
 
 			/* Fill the slot in the NIC ring. */
 			curr->read.buffer_addr = htole64(paddr);
 			curr->read.olinfo_status = htole32(len << IXGBE_ADVTXD_PAYLEN_SHIFT);
 			curr->read.cmd_type_len = htole32(len | flags |
 				IXGBE_ADVTXD_DTYP_DATA | IXGBE_ADVTXD_DCMD_DEXT |
-				IXGBE_ADVTXD_DCMD_IFCS | IXGBE_TXD_CMD_EOP);
+				IXGBE_ADVTXD_DCMD_IFCS);
 			nm_i = nm_next(nm_i, lim);
 			nic_i = nm_next(nic_i, lim);
 		}
@@ -274,7 +289,6 @@ ixgbe_netmap_txsync(struct netmap_kring *kring, int flags)
 		kring->nr_hwtail = nm_prev(netmap_idx_n2k(kring, nic_i), lim);
 	}
 out:
-	nm_txsync_finalize(kring);
 
 	return 0;
 }
@@ -303,7 +317,7 @@ ixgbe_netmap_rxsync(struct netmap_kring *kring, int flags)
 	u_int nic_i;	/* index into the NIC ring */
 	u_int n;
 	u_int const lim = kring->nkr_num_slots - 1;
-	u_int const head = nm_rxsync_prologue(kring);
+	u_int const head = kring->rhead;
 	int force_update = (flags & NAF_FORCE_READ) || kring->nr_kflags & NKR_PENDINTR;
 
 	/* device-specific */
@@ -346,7 +360,8 @@ ixgbe_netmap_rxsync(struct netmap_kring *kring, int flags)
 			if ((staterr & IXGBE_RXD_STAT_DD) == 0)
 				break;
 			ring->slot[nm_i].len = le16toh(curr->wb.upper.length);
-			ring->slot[nm_i].flags = slot_flags;
+			ring->slot[nm_i].flags = (!(staterr & IXGBE_RXD_STAT_EOP) ? NS_MOREFRAG |
+										slot_flags:slot_flags);
 			nm_i = nm_next(nm_i, lim);
 			nic_i = nm_next(nic_i, lim);
 		}
@@ -398,8 +413,6 @@ ixgbe_netmap_rxsync(struct netmap_kring *kring, int flags)
 		IXGBE_WRITE_REG(&adapter->hw, IXGBE_RDT(rxr->reg_idx), nic_i);
 	}
 
-	/* tell userspace that there might be new packets */
-	nm_rxsync_finalize(kring);
 
 	return 0;
 
@@ -545,6 +558,7 @@ ixgbe_netmap_attach(struct SOFTC_T *adapter)
 	na.nm_register = ixgbe_netmap_reg;
 	na.num_tx_rings = adapter->num_tx_queues;
 	na.num_rx_rings = adapter->num_rx_queues;
+	na.nm_intr = ixgbe_netmap_intr;
 	netmap_attach(&na);
 }
 

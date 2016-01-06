@@ -62,7 +62,6 @@ re_netmap_reg(struct netmap_adapter *na, int onoff)
 	struct ifnet *ifp = na->ifp;
 	int error = 0;
 
-	rtnl_lock();
 	NETMAP_LINUX_RTL_WFQ(ifp);
 	rtl8169_close(ifp);
 
@@ -79,7 +78,6 @@ fail:
 		nm_clear_native_flags(na);
 		error = NETMAP_LINUX_RTL_OPEN(ifp) ? EINVAL : 0;
 	}
-	rtnl_unlock();
 	return (error);
 }
 
@@ -163,7 +161,6 @@ re_netmap_txsync(struct netmap_kring *kring, int flags)
 		}
 	}
 out:
-	nm_txsync_finalize(kring);
 	return 0;
 }
 
@@ -182,7 +179,7 @@ re_netmap_rxsync(struct netmap_kring *kring, int flags)
 	u_int nic_i;	/* index into the NIC ring */
 	u_int n;
 	u_int const lim = kring->nkr_num_slots - 1;
-	u_int const head = nm_rxsync_prologue(kring);
+	u_int const head = kring->rhead;
 	int force_update = (flags & NAF_FORCE_READ) || kring->nr_kflags & NKR_PENDINTR;
 
 	if (!netif_carrier_ok(ifp))
@@ -262,8 +259,6 @@ re_netmap_rxsync(struct netmap_kring *kring, int flags)
 		wmb(); // XXX needed ?
 	}
 
-	/* tell userspace that there might be new packets */
-	nm_rxsync_finalize(kring);
 	return 0;
 
 ring_reset:

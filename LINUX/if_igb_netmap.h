@@ -72,7 +72,6 @@ igb_netmap_reg(struct netmap_adapter *na, int onoff)
 	while (test_and_set_bit(__IGB_RESETTING, &adapter->state))
 		usleep_range(1000, 2000);
 
-	rtnl_lock();
 	if (netif_running(adapter->netdev))
 		igb_down(adapter);
 
@@ -86,8 +85,6 @@ igb_netmap_reg(struct netmap_adapter *na, int onoff)
 		igb_up(adapter);
 	else
 		igb_reset(adapter); // XXX is it needed ?
-
-	rtnl_unlock();
 
 	clear_bit(__IGB_RESETTING, &adapter->state);
 	return (0);
@@ -187,7 +184,6 @@ igb_netmap_txsync(struct netmap_kring *kring, int flags)
 		kring->nr_hwtail = nm_prev(netmap_idx_n2k(kring, nic_i), lim);
 	}
 out:
-	nm_txsync_finalize(kring);
 
 	return 0;
 }
@@ -207,7 +203,7 @@ igb_netmap_rxsync(struct netmap_kring *kring, int flags)
 	u_int nic_i;	/* index into the NIC ring */
 	u_int n;
 	u_int const lim = kring->nkr_num_slots - 1;
-	u_int const head = nm_rxsync_prologue(kring);
+	u_int const head = kring->rhead;
 	int force_update = (flags & NAF_FORCE_READ) || kring->nr_kflags & NKR_PENDINTR;
 
 	/* device-specific */
@@ -285,8 +281,6 @@ igb_netmap_rxsync(struct netmap_kring *kring, int flags)
 		writel(nic_i, rxr->tail);
 	}
 
-	/* tell userspace that there might be new packets */
-	nm_rxsync_finalize(kring);
 
 	return 0;
 

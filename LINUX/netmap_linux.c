@@ -29,10 +29,74 @@
 #include <net/netmap.h>
 #include <dev/netmap/netmap_kern.h>
 #include <dev/netmap/netmap_mem2.h>
+#include <dev/netmap/netmap_virt.h>
 #include <linux/rtnetlink.h>
 #include <linux/nsproxy.h>
+#include <net/pkt_sched.h>
+#include <net/sch_generic.h>
 
 #include "netmap_linux_config.h"
+
+void
+nm_os_ifnet_lock(void)
+{
+	rtnl_lock();
+}
+
+void
+nm_os_ifnet_unlock(void)
+{
+	rtnl_unlock();
+}
+
+/* Register for a notification on device removal */
+static int
+linux_netmap_notifier_cb(struct notifier_block *b,
+		unsigned long val, void *v)
+{
+	struct ifnet *ifp = netdev_notifier_info_to_dev(v);
+
+	/* linux calls us while holding rtnl_lock() */
+	switch (val) {
+	case NETDEV_UNREGISTER:
+		netmap_make_zombie(ifp);
+		break;
+	case NETDEV_GOING_DOWN:
+		netmap_disable_all_rings(ifp);
+		break;
+	case NETDEV_UP:
+		netmap_enable_all_rings(ifp);
+		break;
+	default:
+		/* we don't care */
+		break;
+	}
+	return NOTIFY_OK;
+}
+
+static struct notifier_block linux_netmap_netdev_notifier = {
+	.notifier_call = linux_netmap_notifier_cb,
+};
+
+static int nm_os_ifnet_registered;
+
+int
+nm_os_ifnet_init(void)
+{
+	int error = register_netdevice_notifier(&linux_netmap_netdev_notifier);
+	if (!error)
+		nm_os_ifnet_registered = 1;
+	return error;
+}
+
+void
+nm_os_ifnet_fini(void)
+{
+	if (nm_os_ifnet_registered) {
+		unregister_netdevice_notifier(&linux_netmap_netdev_notifier);
+		nm_os_ifnet_registered = 0;
+	}
+}
 
 #ifdef NETMAP_LINUX_HAVE_IOMMU
 #include <linux/iommu.h>
@@ -69,7 +133,8 @@ int nm_iommu_group_id(struct device *dev)
  * as initial value. Both 'cur_sum' and the return value are in host
  * byte order.
  */
-rawsum_t nm_csum_raw(uint8_t *data, size_t len, rawsum_t cur_sum)
+rawsum_t
+nm_os_csum_raw(uint8_t *data, size_t len, rawsum_t cur_sum)
 {
 	return csum_partial(data, len, cur_sum);
 }
@@ -78,7 +143,8 @@ rawsum_t nm_csum_raw(uint8_t *data, size_t len, rawsum_t cur_sum)
  * and 'len' is the IPv4 header length. Return value is in network byte
  * order.
  */
-uint16_t nm_csum_ipv4(struct nm_iphdr *iph)
+uint16_t
+nm_os_csum_ipv4(struct nm_iphdr *iph)
 {
 	return ip_compute_csum((void*)iph, sizeof(struct nm_iphdr));
 }
@@ -87,7 +153,8 @@ uint16_t nm_csum_ipv4(struct nm_iphdr *iph)
  * header, 'data' points to the TCP/UDP header, 'datalen' is the lenght of
  * TCP/UDP header + payload.
  */
-void nm_csum_tcpudp_ipv4(struct nm_iphdr *iph, void *data,
+void
+nm_os_csum_tcpudp_ipv4(struct nm_iphdr *iph, void *data,
 		      size_t datalen, uint16_t *check)
 {
 	*check = csum_tcpudp_magic(iph->saddr, iph->daddr,
@@ -99,7 +166,8 @@ void nm_csum_tcpudp_ipv4(struct nm_iphdr *iph, void *data,
  * header, 'data' points to the TCP/UDP header, 'datalen' is the lenght of
  * TCP/UDP header + payload.
  */
-void nm_csum_tcpudp_ipv6(struct nm_ipv6hdr *ip6h, void *data,
+void
+nm_os_csum_tcpudp_ipv6(struct nm_ipv6hdr *ip6h, void *data,
 		      size_t datalen, uint16_t *check)
 {
 	*check = csum_ipv6_magic((void *)&ip6h->saddr, (void*)&ip6h->daddr,
@@ -107,11 +175,22 @@ void nm_csum_tcpudp_ipv6(struct nm_ipv6hdr *ip6h, void *data,
 				csum_partial(data, datalen, 0));
 }
 
-uint16_t nm_csum_fold(rawsum_t cur_sum)
+uint16_t
+nm_os_csum_fold(rawsum_t cur_sum)
 {
 	return csum_fold(cur_sum);
 }
 
+/* on linux we send up one packet at a time */
+void *
+nm_os_send_up(struct ifnet *ifp, struct mbuf *m, struct mbuf *prev)
+{
+	(void)ifp;
+	(void)prev;
+	m->priority = NM_MAGIC_PRIORITY_RX; /* do not reinject to netmap */
+	netif_rx(m);
+	return NULL;
+}
 
 #ifdef WITH_GENERIC
 /* ####################### MITIGATION SUPPORT ###################### */
@@ -127,7 +206,7 @@ uint16_t nm_csum_fold(rawsum_t cur_sum)
  * - when the timer expires and there are pending packets,
  *   a notification is sent up and the timer is restarted.
  */
-NETMAP_LINUX_TIMER_RTYPE
+static NETMAP_LINUX_TIMER_RTYPE
 generic_timer_handler(struct hrtimer *t)
 {
     struct nm_generic_mit *mit =
@@ -145,16 +224,17 @@ generic_timer_handler(struct hrtimer *t)
     mit->mit_pending = 0;
     /* below is a variation of netmap_generic_irq  XXX revise */
     if (nm_netmap_on(mit->mit_na)) {
-        netmap_common_irq(mit->mit_na->ifp, mit->mit_ring_idx, &work_done);
+        netmap_common_irq(mit->mit_na, mit->mit_ring_idx, &work_done);
         generic_rate(0, 0, 0, 0, 0, 1);
     }
-    netmap_mitigation_restart(mit);
+    nm_os_mitigation_restart(mit);
 
     return HRTIMER_RESTART;
 }
 
 
-void netmap_mitigation_init(struct nm_generic_mit *mit, int idx,
+void
+nm_os_mitigation_init(struct nm_generic_mit *mit, int idx,
                                 struct netmap_adapter *na)
 {
     hrtimer_init(&mit->mit_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
@@ -165,22 +245,26 @@ void netmap_mitigation_init(struct nm_generic_mit *mit, int idx,
 }
 
 
-void netmap_mitigation_start(struct nm_generic_mit *mit)
+void
+nm_os_mitigation_start(struct nm_generic_mit *mit)
 {
     hrtimer_start(&mit->mit_timer, ktime_set(0, netmap_generic_mit), HRTIMER_MODE_REL);
 }
 
-void netmap_mitigation_restart(struct nm_generic_mit *mit)
+void
+nm_os_mitigation_restart(struct nm_generic_mit *mit)
 {
     hrtimer_forward_now(&mit->mit_timer, ktime_set(0, netmap_generic_mit));
 }
 
-int netmap_mitigation_active(struct nm_generic_mit *mit)
+int
+nm_os_mitigation_active(struct nm_generic_mit *mit)
 {
     return hrtimer_active(&mit->mit_timer);
 }
 
-void netmap_mitigation_cleanup(struct nm_generic_mit *mit)
+void
+nm_os_mitigation_cleanup(struct nm_generic_mit *mit)
 {
     hrtimer_cancel(&mit->mit_timer);
 }
@@ -202,29 +286,42 @@ void netmap_mitigation_cleanup(struct nm_generic_mit *mit)
 #ifdef NETMAP_LINUX_HAVE_RX_HANDLER_RESULT
 static rx_handler_result_t linux_generic_rx_handler(struct mbuf **pm)
 {
-    /* If we were called by NM_SEND_UP(), we want to pass the mbuf
-       to network stack. We detect this situation looking at the
-       priority field. */
-    if ((*pm)->priority == NM_MAGIC_PRIORITY_RX)
-            return RX_HANDLER_PASS;
+	int stolen;
 
-    /* When we intercept a sk_buff coming from the driver, it happens that
-       skb->data points to the IP header, e.g. the ethernet header has
-       already been pulled. Since we want the netmap rings to contain the
-       full ethernet header, we push it back, so that the RX ring reader
-       can see it. */
-    skb_push(*pm, 14);
+	/* If we were called by NM_SEND_UP(), we want to pass the mbuf
+	   to network stack. We detect this situation looking at the
+	   priority field. */
+	if ((*pm)->priority == NM_MAGIC_PRIORITY_RX)
+		return RX_HANDLER_PASS;
 
-    /* Steal the mbuf and notify the pollers for a new RX packet. */
-    generic_rx_handler((*pm)->dev, *pm);
+	/* When we intercept a sk_buff coming from the driver, it happens that
+	   skb->data points to the IP header, e.g. the ethernet header has
+	   already been pulled. Since we want the netmap rings to contain the
+	   full ethernet header, we push it back, so that the RX ring reader
+	   can see it. */
+	skb_push(*pm, 14);
 
-    return RX_HANDLER_CONSUMED;
+	/* Possibly steal the mbuf and notify the pollers for a new RX
+	 * packet. */
+	stolen = generic_rx_handler((*pm)->dev, *pm);
+	if (stolen) {
+		return RX_HANDLER_CONSUMED;
+	}
+
+	skb_pull(*pm, 14);
+
+	return RX_HANDLER_PASS;
 }
 #else /* ! HAVE_RX_HANDLER_RESULT */
 static struct sk_buff *linux_generic_rx_handler(struct mbuf *m)
 {
-	generic_rx_handler(m->dev, m);
-	return NULL;
+	int stolen = generic_rx_handler(m->dev, m);
+
+	if (stolen) {
+		return NULL;
+	}
+
+	return m;
 }
 #endif /* HAVE_RX_HANDLER_RESULT */
 #endif /* HAVE_RX_REGISTER */
@@ -233,15 +330,16 @@ static struct sk_buff *linux_generic_rx_handler(struct mbuf *m)
  * the packets incoming from the interface attached to 'na'.
  */
 int
-netmap_catch_rx(struct netmap_adapter *na, int intercept)
+nm_os_catch_rx(struct netmap_generic_adapter *gna, int intercept)
 {
 #ifndef NETMAP_LINUX_HAVE_RX_REGISTER
     return 0;
 #else /* HAVE_RX_REGISTER */
-    struct ifnet *ifp = na->ifp;
+    struct netmap_adapter *na = &gna->up.up;
+    struct ifnet *ifp = netmap_generic_getifp(gna);
 
     if (intercept) {
-        return -netdev_rx_handler_register(na->ifp,
+        return -netdev_rx_handler_register(ifp,
                 &linux_generic_rx_handler, na);
     } else {
         netdev_rx_handler_unregister(ifp);
@@ -251,7 +349,8 @@ netmap_catch_rx(struct netmap_adapter *na, int intercept)
 }
 
 #ifdef NETMAP_LINUX_SELECT_QUEUE
-u16 generic_ndo_select_queue(struct ifnet *ifp, struct mbuf *m
+static u16
+generic_ndo_select_queue(struct ifnet *ifp, struct mbuf *m
 #if NETMAP_LINUX_SELECT_QUEUE >= 3
                                 , void *accel_priv
 #if NETMAP_LINUX_SELECT_QUEUE >= 4
@@ -275,87 +374,325 @@ u16 generic_ndo_select_queue(struct ifnet *ifp, struct mbuf *m
 static netdev_tx_t
 generic_ndo_start_xmit(struct mbuf *m, struct ifnet *ifp)
 {
-    struct netmap_generic_adapter *gna =
-                        (struct netmap_generic_adapter *)NA(ifp);
+	struct netmap_generic_adapter *gna =
+		(struct netmap_generic_adapter *)NA(ifp);
 
-    if (likely(m->priority == NM_MAGIC_PRIORITY_TX))
-        return gna->save_start_xmit(m, ifp); /* To the driver. */
+	if (likely(m->priority == NM_MAGIC_PRIORITY_TX)) {
+		/* Reset priority, so that generic_netmap_tx_clean()
+		 * knows that it can reclaim this mbuf. */
+		m->priority = 0;
+		return gna->save_start_xmit(m, ifp); /* To the driver. */
+	}
 
-    /* To a netmap RX ring. */
-    return linux_netmap_start_xmit(m, ifp);
+	/* To a netmap RX ring. */
+	return linux_netmap_start_xmit(m, ifp);
+}
+
+struct nm_generic_qdisc {
+	unsigned int qidx;
+	unsigned int limit;
+};
+
+static int
+generic_qdisc_init(struct Qdisc *qdisc, struct nlattr *opt)
+{
+	struct nm_generic_qdisc *priv = NULL;
+
+	/* Kernel < 2.6.39, do not have qdisc->limit, so we will
+	 * always use our priv->limit, for simplicity. */
+
+	priv = qdisc_priv(qdisc);
+	priv->qidx = 0;
+	priv->limit = 1024; /* This is going to be overridden. */
+
+	if (opt) {
+		struct nm_generic_qdisc *qdiscopt = nla_data(opt);
+
+		if (nla_len(opt) < sizeof(*qdiscopt)) {
+			D("Invalid netlink attribute");
+			return EINVAL;
+		}
+
+		priv->qidx = qdiscopt->qidx;
+		priv->limit = qdiscopt->limit;
+		D("Qdisc #%d initialized with max_len = %u", priv->qidx,
+				                             priv->limit);
+	}
+
+	/* Qdisc bypassing is not an option for now.
+	qdisc->flags |= TCQ_F_CAN_BYPASS; */
+
+	return 0;
+}
+
+static int
+generic_qdisc_enqueue(struct mbuf *m, struct Qdisc *qdisc)
+{
+	struct nm_generic_qdisc *priv = qdisc_priv(qdisc);
+
+	if (unlikely(qdisc_qlen(qdisc) >= priv->limit)) {
+		RD(5, "dropping mbuf");
+
+		return qdisc_drop(m, qdisc);
+		/* or qdisc_reshape_fail() ? */
+	}
+
+	ND(5, "Enqueuing mbuf, len %u", qdisc_qlen(qdisc));
+
+	return qdisc_enqueue_tail(m, qdisc);
+}
+
+static struct mbuf *
+generic_qdisc_dequeue(struct Qdisc *qdisc)
+{
+	struct mbuf *m = qdisc_dequeue_head(qdisc);
+	bool event;
+
+	if (!m) {
+		return NULL;
+	}
+
+	event = (m->priority == NM_MAGIC_PRIORITY_TXQE);
+	m->priority = NM_MAGIC_PRIORITY_TX;
+
+	if (event) {
+		ND(5, "Event met, notify %p", m);
+		netmap_generic_irq(NA(qdisc_dev(qdisc)),
+				   skb_get_queue_mapping(m), NULL);
+	}
+
+	ND(5, "Dequeuing mbuf, len %u", qdisc_qlen(qdisc));
+
+	return m;
+}
+
+static struct mbuf *
+generic_qdisc_peek(struct Qdisc *qdisc)
+{
+	RD(5, "Peeking queue, curr len %u", qdisc_qlen(qdisc));
+	return skb_peek(&qdisc->q);
+}
+
+static unsigned int
+generic_qdisc_drop(struct Qdisc *qdisc)
+{
+	RD(5, "Dropping on purpose");
+	return qdisc_queue_drop(qdisc);
+}
+
+static struct Qdisc_ops
+generic_qdisc_ops __read_mostly = {
+	.id		= "netmap_generic",
+	.priv_size	= sizeof(struct nm_generic_qdisc),
+	.init		= generic_qdisc_init,
+	.reset		= qdisc_reset_queue,
+	.change		= generic_qdisc_init,
+	.enqueue	= generic_qdisc_enqueue,
+	.dequeue	= generic_qdisc_dequeue,
+	.peek		= generic_qdisc_peek,
+	.drop		= generic_qdisc_drop,
+	.dump		= NULL,
+	.owner		= THIS_MODULE,
+};
+
+static int
+nm_os_catch_qdisc(struct netmap_generic_adapter *gna, int intercept)
+{
+	struct netmap_adapter *na = &gna->up.up;
+	struct ifnet *ifp = netmap_generic_getifp(gna);
+	struct nm_generic_qdisc *qdiscopt = NULL;
+	struct Qdisc *fqdisc = NULL;
+	struct nlattr *nla = NULL;
+	struct netdev_queue *txq;
+	unsigned int i;
+
+	if (!gna->txqdisc) {
+		return 0;
+	}
+
+	if (intercept) {
+		nla = kmalloc(nla_attr_size(sizeof(*qdiscopt)),
+				GFP_KERNEL);
+		if (!nla) {
+			D("Failed to allocate netlink attribute");
+			return ENOMEM;
+		}
+		nla->nla_type = RTM_NEWQDISC;
+		nla->nla_len = nla_attr_size(sizeof(*qdiscopt));
+		qdiscopt = (struct nm_generic_qdisc *)nla_data(nla);
+		memset(qdiscopt, 0, sizeof(*qdiscopt));
+		qdiscopt->limit = na->num_tx_desc;
+	}
+
+	if (ifp->flags & IFF_UP) {
+		dev_deactivate(ifp);
+	}
+
+	/* Replace the current qdiscs with our own. */
+	for (i = 0; i < ifp->real_num_tx_queues; i++) {
+		struct Qdisc *nqdisc = NULL;
+		struct Qdisc *oqdisc;
+		int err;
+
+		txq = netdev_get_tx_queue(ifp, i);
+
+		if (intercept) {
+			/* This takes a refcount to netmap module, alloc the
+			 * qdisc and calls the init() op with NULL netlink
+			 * attribute. */
+			nqdisc = qdisc_create_dflt(
+#ifndef NETMAP_LINUX_QDISC_CREATE_DFLT_3ARGS
+					ifp,
+#endif  /* NETMAP_LINUX_QDISC_CREATE_DFLT_3ARGS */
+					txq, &generic_qdisc_ops,
+					TC_H_UNSPEC);
+			if (!nqdisc) {
+				D("Failed to create qdisc");
+				goto qdisc_create;
+			}
+			fqdisc = fqdisc ?: nqdisc;
+
+			/* Call the change() op passing a valid netlink
+			 * attribute. This is used to set the queue idx. */
+			qdiscopt->qidx = i;
+			err = nqdisc->ops->change(nqdisc, nla);
+			if (err) {
+				D("Failed to init qdisc");
+				goto qdisc_create;
+			}
+		}
+
+		oqdisc = dev_graft_qdisc(txq, nqdisc);
+		/* We can call this also with
+		 * odisc == &noop_qdisc, since the noop
+		 * qdisc has the TCQ_F_BUILTIN flag set,
+		 * and so qdisc_destroy will skip it. */
+		qdisc_destroy(oqdisc);
+	}
+
+	kfree(nla);
+
+	if (ifp->qdisc) {
+		qdisc_destroy(ifp->qdisc);
+	}
+	if (intercept) {
+		atomic_inc(&fqdisc->refcnt);
+		ifp->qdisc = fqdisc;
+	} else {
+		ifp->qdisc = &noop_qdisc;
+	}
+
+	if (ifp->flags & IFF_UP) {
+		dev_activate(ifp);
+	}
+
+	return 0;
+
+qdisc_create:
+	if (nla) {
+		kfree(nla);
+	}
+
+	nm_os_catch_qdisc(gna, 0);
+
+	return -1;
 }
 
 /* Must be called under rtnl. */
-void netmap_catch_tx(struct netmap_generic_adapter *gna, int enable)
+int
+nm_os_catch_tx(struct netmap_generic_adapter *gna, int intercept)
 {
-    struct netmap_adapter *na = &gna->up.up;
-    struct ifnet *ifp = na->ifp;
+	struct netmap_adapter *na = &gna->up.up;
+	struct ifnet *ifp = netmap_generic_getifp(gna);
+	int err;
 
-    if (enable) {
-        /*
-         * Save the old pointer to the netdev_ops,
-         * create an updated netdev ops replacing the
-         * ndo_select_queue() and ndo_start_xmit() methods
-         * with our custom ones, and make the driver use it.
-         */
-        na->if_transmit = (void *)ifp->netdev_ops;
-        /* Save a redundant copy of ndo_start_xmit(). */
-        gna->save_start_xmit = ifp->netdev_ops->ndo_start_xmit;
+	err = nm_os_catch_qdisc(gna, intercept);
+	if (err) {
+		return err;
+	}
 
-        gna->generic_ndo = *ifp->netdev_ops;  /* Copy all */
-        gna->generic_ndo.ndo_start_xmit = &generic_ndo_start_xmit;
+	if (intercept) {
+		/*
+		 * Save the old pointer to the netdev_ops,
+		 * create an updated netdev ops replacing the
+		 * ndo_select_queue() and ndo_start_xmit() methods
+		 * with our custom ones, and make the driver use it.
+		 */
+		na->if_transmit = (void *)ifp->netdev_ops;
+		/* Save a redundant copy of ndo_start_xmit(). */
+		gna->save_start_xmit = ifp->netdev_ops->ndo_start_xmit;
+
+		gna->generic_ndo = *ifp->netdev_ops;  /* Copy all */
+		gna->generic_ndo.ndo_start_xmit = &generic_ndo_start_xmit;
 #ifndef NETMAP_LINUX_SELECT_QUEUE
-	printk("%s: no packet steering support\n", __FUNCTION__);
+		D("No packet steering support");
 #else
-        gna->generic_ndo.ndo_select_queue = &generic_ndo_select_queue;
+		gna->generic_ndo.ndo_select_queue = &generic_ndo_select_queue;
 #endif
 
-        ifp->netdev_ops = &gna->generic_ndo;
-    } else {
-	/* Restore the original netdev_ops. */
-        ifp->netdev_ops = (void *)na->if_transmit;
-    }
+		ifp->netdev_ops = &gna->generic_ndo;
+
+	} else {
+		/* Restore the original netdev_ops. */
+		ifp->netdev_ops = (void *)na->if_transmit;
+	}
+
+	return 0;
 }
 
 /* Transmit routine used by generic_netmap_txsync(). Returns 0 on success
    and -1 on error (which may be packet drops or other errors). */
-int generic_xmit_frame(struct ifnet *ifp, struct mbuf *m,
-	void *addr, u_int len, u_int ring_nr)
+int
+nm_os_generic_xmit_frame(struct nm_os_gen_arg *a)
 {
-    netdev_tx_t ret;
+	struct sk_buff *m = a->m;
+	u_int len = a->len;
+	netdev_tx_t ret;
 
-    /* Empty the sk_buff. */
-    if (unlikely(skb_headroom(m)))
-	skb_push(m, skb_headroom(m));
-    skb_trim(m, 0);
+	/* Empty the sk_buff. */
+	if (unlikely(skb_headroom(m)))
+		skb_push(m, skb_headroom(m));
+	skb_trim(m, 0);
 
-    /* TODO Support the slot flags (NS_MOREFRAG, NS_INDIRECT). */
-    skb_copy_to_linear_data(m, addr, len); // skb_store_bits(m, 0, addr, len);
-    skb_put(m, len);
-    NM_ATOMIC_INC(&m->users);
-    m->dev = ifp;
-    /* Tell generic_ndo_start_xmit() to pass this mbuf to the driver. */
-    m->priority = NM_MAGIC_PRIORITY_TX;
-    skb_set_queue_mapping(m, ring_nr);
+	/* TODO Support the slot flags (NS_MOREFRAG, NS_INDIRECT). */
+	skb_copy_to_linear_data(m, a->addr, len); // skb_store_bits(m, 0, addr, len);
+	skb_put(m, len);
+	NM_ATOMIC_INC(&m->users);
+	m->dev = a->ifp;
+	/* Tell generic_ndo_start_xmit() to pass this mbuf to the driver. */
+	skb_set_queue_mapping(m, a->ring_nr);
+	m->priority = a->qevent ? NM_MAGIC_PRIORITY_TXQE : NM_MAGIC_PRIORITY_TX;
 
-    ret = dev_queue_xmit(m);
+	ret = dev_queue_xmit(m);
 
-    if (likely(ret == NET_XMIT_SUCCESS)) {
-        return 0;
-    }
-    if (unlikely(ret != NET_XMIT_DROP)) {
-        /* If something goes wrong in the TX path, there is nothing
-           intelligent we can do (for now) apart from error reporting. */
-        RD(5, "dev_queue_xmit failed: HARD ERROR %d", ret);
-    }
-    return -1;
+	if (unlikely(ret != NET_XMIT_SUCCESS)) {
+		/* Reset priority, so that generic_netmap_tx_clean() can
+		 * reclaim this mbuf. */
+		m->priority = 0;
+
+		/* Qdisc queue is full (this cannot happen with
+		 * the netmap-aware qdisc, see exaplanation in
+		 * netmap_generic_txsync), or qdisc is being
+		 * deactivated. In the latter case dev_queue_xmit()
+		 * does not call the enqueue method and returns
+		 * NET_XMIT_DROP.
+		 * If there is no carrier, the generic qdisc is
+		 * not yet active (is pending in the qdisc_sleeping
+		 * field), and so the temporary noop qdisc enqueue
+		 * method will drop the packet and return NET_XMIT_CN.
+		 */
+		RD(3, "Warning: dev_queue_xmit() is dropping [%d]", ret);
+		return -1;
+	}
+
+	return 0;
 }
 #endif /* WITH_GENERIC */
 
 /* Use ethtool to find the current NIC rings lengths, so that the netmap
    rings can have the same lengths. */
 int
-generic_find_num_desc(struct ifnet *ifp, unsigned int *tx, unsigned int *rx)
+nm_os_generic_find_num_desc(struct ifnet *ifp, unsigned int *tx, unsigned int *rx)
 {
     int error = EOPNOTSUPP;
 #ifdef NETMAP_LINUX_HAVE_GET_RINGPARAM
@@ -363,9 +700,10 @@ generic_find_num_desc(struct ifnet *ifp, unsigned int *tx, unsigned int *rx)
 
     if (ifp->ethtool_ops && ifp->ethtool_ops->get_ringparam) {
         ifp->ethtool_ops->get_ringparam(ifp, &rp);
-        *tx = rp.tx_pending;
-        *rx = rp.rx_pending;
-	error = 0;
+        *tx = rp.tx_pending ? rp.tx_pending : rp.tx_max_pending;
+        *rx = rp.rx_pending ? rp.rx_pending : rp.rx_max_pending;
+	if (*tx && *rx)
+		error = 0;
     }
 #endif /* HAVE_GET_RINGPARAM */
     return error;
@@ -373,15 +711,33 @@ generic_find_num_desc(struct ifnet *ifp, unsigned int *tx, unsigned int *rx)
 
 /* Fills in the output arguments with the number of hardware TX/RX queues. */
 void
-generic_find_num_queues(struct ifnet *ifp, u_int *txq, u_int *rxq)
+nm_os_generic_find_num_queues(struct ifnet *ifp, u_int *txq, u_int *rxq)
 {
-#ifdef NETMAP_LINUX_HAVE_NUM_QUEUES
-    *txq = ifp->real_num_tx_queues;
-    *rxq = ifp->real_num_rx_queues;
+#ifdef NETMAP_LINUX_HAVE_SET_CHANNELS
+    struct ethtool_channels ch;
+    memset(&ch, 0, sizeof(ch));
+    if (ifp->ethtool_ops && ifp->ethtool_ops->get_channels) {
+	    ifp->ethtool_ops->get_channels(ifp, &ch);
+	    *txq = ch.tx_count ? ch.tx_count : ch.combined_count;
+	    *rxq = ch.rx_count ? ch.rx_count : ch.combined_count;
+    } else
+#endif /* HAVE_SET_CHANNELS */
+    {
+#if defined(NETMAP_LINUX_HAVE_NUM_QUEUES)
+    	*txq = ifp->real_num_tx_queues;
+    	*rxq = ifp->real_num_rx_queues;
 #else
-    *txq = 1;
-    *rxq = 1; /* TODO ifp->real_num_rx_queues */
+    	*txq = 1;
+    	*rxq = 1; /* TODO ifp->real_num_rx_queues */
 #endif /* HAVE_NUM_QUEUES */
+    }
+}
+
+void
+nm_os_generic_set_features(struct netmap_generic_adapter *gna)
+{
+	gna->rxsg = 1; /* Supported through skb_copy_bits(). */
+	gna->txqdisc = netmap_generic_txqdisc;
 }
 
 int
@@ -398,10 +754,10 @@ netmap_linux_config(struct netmap_adapter *na,
 		error = ENXIO;
 		goto out;
 	}
-	error = generic_find_num_desc(ifp, txd, rxd);
+	error = nm_os_generic_find_num_desc(ifp, txd, rxd);
 	if (error)
 		goto out;
-	generic_find_num_queues(ifp, txr, rxr);
+	nm_os_generic_find_num_queues(ifp, txr, rxr);
 
 out:
 	rtnl_unlock();
@@ -431,7 +787,10 @@ void if_rele(struct net_device *ifp)
 	dev_put(ifp);
 }
 
-
+struct nm_linux_selrecord_t {
+	struct file *file;
+	struct poll_table_struct *pwait;
+};
 
 /*
  * Remap linux arguments into the FreeBSD call.
@@ -451,10 +810,15 @@ linux_netmap_poll(struct file * file, struct poll_table_struct *pwait)
 #else
 	int events = POLLIN | POLLOUT; /* XXX maybe... */
 #endif /* PWAIT_KEY */
-	return netmap_poll((void *)pwait, events, (void *)file);
+	struct nm_linux_selrecord_t sr = {
+		.file = file,
+		.pwait = pwait
+	};
+	struct netmap_priv_d *priv = file->private_data;
+	return netmap_poll(priv, events, &sr);
 }
 
-int
+static int
 linux_netmap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 {
 	struct netmap_priv_d *priv = vma->vm_private_data;
@@ -563,14 +927,15 @@ linux_netmap_set_channels(struct net_device *dev,
 
 #ifndef NETMAP_LINUX_HAVE_UNLOCKED_IOCTL
 #define LIN_IOCTL_NAME	.ioctl
-int
+static int
 linux_netmap_ioctl(struct inode *inode, struct file *file, u_int cmd, u_long data /* arg */)
 #else
 #define LIN_IOCTL_NAME	.unlocked_ioctl
-long
+static long
 linux_netmap_ioctl(struct file *file, u_int cmd, u_long data /* arg */)
 #endif
 {
+	struct netmap_priv_d *priv = file->private_data;
 	int ret = 0;
 	union {
 		struct nm_ifreq ifr;
@@ -596,7 +961,7 @@ linux_netmap_ioctl(struct file *file, u_int cmd, u_long data /* arg */)
 		if (copy_from_user(&arg, (void *)data, argsize) != 0)
 			return -EFAULT;
 	}
-	ret = netmap_ioctl(NULL, cmd, (caddr_t)&arg, 0, (void *)file);
+	ret = netmap_ioctl(priv, cmd, (caddr_t)&arg, NULL);
 	if (data && copy_to_user((void*)data, &arg, argsize) != 0)
 		return -EFAULT;
 	return -ret;
@@ -617,14 +982,18 @@ static int
 linux_netmap_open(struct inode *inode, struct file *file)
 {
 	struct netmap_priv_d *priv;
+	int error;
 	(void)inode;	/* UNUSED */
 
-	priv = malloc(sizeof(struct netmap_priv_d), M_DEVBUF,
-			      M_NOWAIT | M_ZERO);
-	if (priv == NULL)
-		return -ENOMEM;
-
+	NMG_LOCK();
+	priv = netmap_priv_new();
+	if (priv == NULL) {
+		error = -ENOMEM;
+		goto out;
+	}
 	file->private_data = priv;
+out:
+	NMG_UNLOCK();
 
 	return (0);
 }
@@ -1317,6 +1686,7 @@ static int netmap_socket_recvmsg(struct kiocb *iocb, struct socket *sock,
 #endif /* WITH_V1000 */
 
 
+#ifdef WITH_VALE
 #ifdef CONFIG_NET_NS
 #include <net/netns/generic.h>
 
@@ -1329,7 +1699,7 @@ struct netmap_bns {
 };
 
 #ifdef NETMAP_LINUX_HAVE_PERNET_OPS_ID
-int
+static int
 nm_bns_create(struct net *net, struct netmap_bns **ns)
 {
 	*ns = net_generic(net, netmap_bns_id);
@@ -1337,7 +1707,7 @@ nm_bns_create(struct net *net, struct netmap_bns **ns)
 }
 #define nm_bns_destroy(_1, _2)
 #else
-int
+static int
 nm_bns_create(struct net *net, struct netmap_bns **ns)
 {
 	int error = 0;
@@ -1446,7 +1816,578 @@ netmap_bns_unregister(void)
 			&netmap_pernet_ops);
 #endif
 }
-#endif
+#endif /* CONFIG_NET_NS */
+#endif /* WITH_VALE */
+
+/* ##################### kthread wrapper ##################### */
+#include <linux/eventfd.h>
+#include <linux/mm.h>
+#include <linux/mmu_context.h>
+#include <linux/poll.h>
+#include <linux/kthread.h>
+#include <linux/cpumask.h> /* nr_cpu_ids */
+
+u_int
+nm_os_ncpus(void)
+{
+	return nr_cpu_ids;
+}
+
+/* kthread context */
+struct nm_kthread_ctx {
+    /* files to exchange notifications */
+    struct file *ioevent_file;          /* notification from guest */
+    struct file *irq_file;              /* notification to guest (interrupt) */
+    struct eventfd_ctx  *irq_ctx;
+
+    /* poll ioeventfd to receive notification from the guest */
+    poll_table poll_table;
+    wait_queue_head_t *waitq_head;
+    wait_queue_t waitq;
+
+    /* worker function and parameter */
+    nm_kthread_worker_fn_t worker_fn;
+    void *worker_private;
+
+    struct nm_kthread *nmk;
+
+    /* integer to manage multiple worker contexts (e.g., RX or TX in ptnetmap) */
+    long type;
+};
+
+struct nm_kthread {
+    struct mm_struct *mm;
+    struct task_struct *worker;
+
+    atomic_t scheduled;         /* pending wake_up request */
+    int attach_user;            /* kthread attached to user_process */
+
+    struct nm_kthread_ctx worker_ctx;
+    int affinity;
+};
+
+void inline
+nm_os_kthread_wakeup_worker(struct nm_kthread *nmk)
+{
+    /*
+     * There may be a race between FE and BE,
+     * which call both this function, and worker kthread,
+     * that reads ptk->scheduled.
+     *
+     * For us it is not important the counter value,
+     * but simply that it has changed since the last
+     * time the kthread saw it.
+     */
+    atomic_inc(&nmk->scheduled);
+    wake_up_process(nmk->worker);
+}
+
+
+static void
+nm_kthread_poll_fn(struct file *file, wait_queue_head_t *wq_head, poll_table *pt)
+{
+    struct nm_kthread_ctx *ctx;
+
+    ctx = container_of(pt, struct nm_kthread_ctx, poll_table);
+    ctx->waitq_head = wq_head;
+    add_wait_queue(wq_head, &ctx->waitq);
+}
+
+static int
+nm_kthread_poll_wakeup(wait_queue_t *wq, unsigned mode, int sync, void *key)
+{
+    struct nm_kthread_ctx *ctx;
+
+    ctx = container_of(wq, struct nm_kthread_ctx, waitq);
+    nm_os_kthread_wakeup_worker(ctx->nmk);
+    return 0;
+}
+
+static void inline
+nm_kthread_worker_fn(struct nm_kthread_ctx *ctx)
+{
+    __set_current_state(TASK_RUNNING);
+    ctx->worker_fn(ctx->worker_private); /* worker body */
+    if (need_resched())
+        schedule();
+}
+
+static int
+nm_kthread_worker(void *data)
+{
+    struct nm_kthread *nmk = data;
+    struct nm_kthread_ctx *ctx = &nmk->worker_ctx;
+    int old_scheduled = atomic_read(&nmk->scheduled);
+    int new_scheduled = old_scheduled;
+    mm_segment_t oldfs = get_fs();
+
+    if (nmk->mm) {
+        set_fs(USER_DS);
+        use_mm(nmk->mm);
+    }
+
+    while (!kthread_should_stop()) {
+        /*
+         * if ioevent_file is not defined, we don't have notification
+         * mechanism and we continually execute worker_fn()
+         */
+        if (!ctx->ioevent_file) {
+            nm_kthread_worker_fn(ctx);
+        } else {
+            /*
+             * Set INTERRUPTIBLE state before to check if there is work.
+             * if wake_up() is called, although we have not seen the new
+             * counter value, the kthread state is set to RUNNING and
+             * after schedule() it is not moved off run queue.
+             */
+            set_current_state(TASK_INTERRUPTIBLE);
+
+            new_scheduled = atomic_read(&nmk->scheduled);
+
+            /* checks if there is a pending notification */
+            if (likely(new_scheduled != old_scheduled)) {
+                old_scheduled = new_scheduled;
+                nm_kthread_worker_fn(ctx);
+            } else {
+                schedule();
+            }
+        }
+    }
+
+    __set_current_state(TASK_RUNNING);
+
+    if (nmk->mm) {
+        unuse_mm(nmk->mm);
+    }
+
+    set_fs(oldfs);
+    return 0;
+}
+
+void inline
+nm_os_kthread_send_irq(struct nm_kthread *nmk)
+{
+    if (nmk->worker_ctx.irq_ctx)
+        eventfd_signal(nmk->worker_ctx.irq_ctx, 1);
+}
+
+static int
+nm_kthread_open_files(struct nm_kthread *nmk, struct nm_kth_event_cfg *ring_cfg)
+{
+    struct file *file;
+    struct nm_kthread_ctx *wctx = &nmk->worker_ctx;
+
+    if (ring_cfg->ioeventfd) {
+	file = eventfd_fget(ring_cfg->ioeventfd);
+	if (IS_ERR(file))
+	    return -PTR_ERR(file);
+	wctx->ioevent_file = file;
+    }
+
+    if (ring_cfg->irqfd) {
+	file = eventfd_fget(ring_cfg->irqfd);
+	if (IS_ERR(file))
+            goto err;
+	wctx->irq_file = file;
+	wctx->irq_ctx = eventfd_ctx_fileget(file);
+    }
+
+    return 0;
+err:
+    if (wctx->ioevent_file) {
+        fput(wctx->ioevent_file);
+        wctx->ioevent_file = NULL;
+    }
+
+    return -PTR_ERR(file);
+}
+
+static void
+nm_kthread_close_files(struct nm_kthread *nmk)
+{
+    struct nm_kthread_ctx *wctx = &nmk->worker_ctx;
+
+    if (wctx->ioevent_file) {
+        fput(wctx->ioevent_file);
+        wctx->ioevent_file = NULL;
+    }
+
+    if (wctx->irq_file) {
+        fput(wctx->irq_file);
+        wctx->irq_file = NULL;
+        eventfd_ctx_put(wctx->irq_ctx);
+        wctx->irq_ctx = NULL;
+    }
+}
+
+static void
+nm_kthread_init_poll(struct nm_kthread *nmk, struct nm_kthread_ctx *ctx)
+{
+    init_waitqueue_func_entry(&ctx->waitq, nm_kthread_poll_wakeup);
+    init_poll_funcptr(&ctx->poll_table, nm_kthread_poll_fn);
+    ctx->nmk = nmk;
+}
+
+static int
+nm_kthread_start_poll(struct nm_kthread_ctx *ctx, struct file *file)
+{
+    unsigned long mask;
+    int ret = 0;
+
+    if (ctx->waitq_head)
+        return 0;
+    mask = file->f_op->poll(file, &ctx->poll_table);
+    if (mask)
+        nm_kthread_poll_wakeup(&ctx->waitq, 0, 0, (void *)mask);
+    if (mask & POLLERR) {
+        if (ctx->waitq_head)
+            remove_wait_queue(ctx->waitq_head, &ctx->waitq);
+        ret = EINVAL;
+    }
+    return ret;
+}
+
+static void
+nm_kthread_stop_poll(struct nm_kthread_ctx *ctx)
+{
+    if (ctx->waitq_head) {
+        remove_wait_queue(ctx->waitq_head, &ctx->waitq);
+        ctx->waitq_head = NULL;
+    }
+}
+
+void
+nm_os_kthread_set_affinity(struct nm_kthread *nmk, int affinity)
+{
+	nmk->affinity = affinity;
+}
+
+struct nm_kthread *
+nm_os_kthread_create(struct nm_kthread_cfg *cfg)
+{
+    struct nm_kthread *nmk = NULL;
+    int error;
+
+    nmk = kzalloc(sizeof *nmk, GFP_KERNEL);
+    if (!nmk)
+        return NULL;
+
+    nmk->worker_ctx.worker_fn = cfg->worker_fn;
+    nmk->worker_ctx.worker_private = cfg->worker_private;
+    nmk->worker_ctx.type = cfg->type;
+    atomic_set(&nmk->scheduled, 0);
+
+    /* attach kthread to user process (ptnetmap) */
+    nmk->attach_user = cfg->attach_user;
+
+    /* open event fd */
+    error = nm_kthread_open_files(nmk, &cfg->event);
+    if (error)
+        goto err;
+
+    nm_kthread_init_poll(nmk, &nmk->worker_ctx);
+
+    return nmk;
+err:
+    //XXX: set errno?
+    kfree(nmk);
+    return NULL;
+}
+
+int
+nm_os_kthread_start(struct nm_kthread *nmk)
+{
+    int error = 0;
+    char name[16];
+
+    if (nmk->worker) {
+        return EBUSY;
+    }
+
+    /* check if we want to attach kthread to user process */
+    if (nmk->attach_user) {
+        nmk->mm = get_task_mm(current);
+    }
+
+    /* ToDo Make this able to pass arbitrary string (e.g., for 'nm_') from nmk */
+    snprintf(name, sizeof(name), "nm_kthread-%ld-%d", nmk->worker_ctx.type, current->pid);
+    nmk->worker = kthread_create(nm_kthread_worker, nmk, name);
+    if (!IS_ERR(nmk->worker)) {
+	kthread_bind(nmk->worker, nmk->affinity);
+	wake_up_process(nmk->worker);
+    }
+
+    if (IS_ERR(nmk->worker)) {
+	error = -PTR_ERR(nmk->worker);
+	goto err;
+    }
+
+    if (nmk->worker_ctx.ioevent_file) {
+	error = nm_kthread_start_poll(&nmk->worker_ctx, nmk->worker_ctx.ioevent_file);
+	if (error) {
+            goto err_kstop;
+	}
+    }
+
+    return 0;
+err_kstop:
+    kthread_stop(nmk->worker);
+err:
+    nmk->worker = NULL;
+    if (nmk->mm)
+        mmput(nmk->mm);
+    nmk->mm = NULL;
+    return error;
+}
+
+void
+nm_os_kthread_stop(struct nm_kthread *nmk)
+{
+    if (!nmk->worker) {
+        return;
+    }
+
+    nm_kthread_stop_poll(&nmk->worker_ctx);
+
+    if (nmk->worker) {
+        kthread_stop(nmk->worker);
+        nmk->worker = NULL;
+    }
+
+    if (nmk->mm) {
+        mmput(nmk->mm);
+        nmk->mm = NULL;
+    }
+}
+
+void
+nm_os_kthread_delete(struct nm_kthread *nmk)
+{
+    if (!nmk)
+        return;
+
+    if (nmk->worker) {
+        nm_os_kthread_stop(nmk);
+    }
+
+    nm_kthread_close_files(nmk);
+
+    kfree(nmk);
+}
+
+/* ##################### PTNETMAP SUPPORT ##################### */
+#ifdef WITH_PTNETMAP_GUEST
+/*
+ * ptnetmap memory device (memdev) for linux guest
+ * Used to expose host memory to the guest through PCI-BAR
+ */
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/pci.h>
+
+/*
+ * PCI Device ID Table
+ * list of (VendorID,DeviceID) supported by this driver
+ */
+static struct pci_device_id ptn_memdev_ids[] = {
+    { PCI_DEVICE(PTNETMAP_PCI_VENDOR_ID, PTNETMAP_PCI_DEVICE_ID), },
+    { 0, }
+};
+
+MODULE_DEVICE_TABLE(pci, ptn_memdev_ids);
+
+/*
+ * ptnetmap memdev private data structure
+ */
+struct ptnetmap_memdev
+{
+    struct pci_dev *pdev;
+    void __iomem *pci_io;
+    void __iomem *pci_mem;
+    struct netmap_mem_d *nm_mem;
+    int bars;
+};
+
+/*
+ * map host netmap memory through PCI-BAR in the guest OS
+ *
+ * return physical (nm_paddr) and virtual (nm_addr) addresses
+ * of the netmap memory mapped in the guest.
+ */
+int
+nm_os_pt_memdev_iomap(struct ptnetmap_memdev *ptn_dev, vm_paddr_t *nm_paddr, void **nm_addr)
+{
+    struct pci_dev *pdev = ptn_dev->pdev;
+    uint32_t mem_size;
+    phys_addr_t mem_paddr;
+    int err = 0;
+
+    mem_size = ioread32(ptn_dev->pci_io + PTNETMAP_IO_PCI_MEMSIZE);
+
+    D("=== BAR %d start %llx len %llx mem_size %x ===",
+            PTNETMAP_MEM_PCI_BAR,
+            pci_resource_start(pdev, PTNETMAP_MEM_PCI_BAR),
+            pci_resource_len(pdev, PTNETMAP_MEM_PCI_BAR),
+            mem_size);
+
+    /* map memory allocator */
+    mem_paddr = pci_resource_start(pdev, PTNETMAP_MEM_PCI_BAR);
+    ptn_dev->pci_mem = *nm_addr = ioremap_cache(mem_paddr, mem_size);
+    if (ptn_dev->pci_mem == NULL) {
+        err = -ENOMEM;
+    }
+    *nm_paddr = mem_paddr;
+
+    return err;
+}
+
+/*
+ * unmap PCI-BAR
+ */
+void
+nm_os_pt_memdev_iounmap(struct ptnetmap_memdev *ptn_dev)
+{
+    if (ptn_dev->pci_mem) {
+        iounmap(ptn_dev->pci_mem);
+        ptn_dev->pci_mem = NULL;
+    }
+}
+
+/*
+ * Device Initialization Routine
+ *
+ * Returns 0 on success, negative on failure
+ */
+static int
+ptn_memdev_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+{
+    struct ptnetmap_memdev *ptn_dev;
+    int bars, err;
+    uint16_t mem_id;
+
+    ND("ptn_memdev_driver probe START");
+
+    /* allocate our structure and fill it out */
+    ptn_dev = kzalloc(sizeof(*ptn_dev), GFP_KERNEL);
+    if (ptn_dev == NULL)
+        return -ENOMEM;
+
+    ptn_dev->pdev = pdev;
+    bars = pci_select_bars(pdev, IORESOURCE_MEM | IORESOURCE_IO);
+    /* enable the device */
+    err = pci_enable_device(pdev); /* XXX-ste: device_mem() */
+    if (err)
+        goto err;
+
+    err = pci_request_selected_regions(pdev, bars, PTN_MEMDEV_NAME);
+    if (err)
+        goto err_pci_reg;
+
+    ptn_dev->pci_io = pci_iomap(pdev, PTNETMAP_IO_PCI_BAR, 0);
+    if (ptn_dev->pci_io == NULL) {
+        err = -ENOMEM;
+        goto err_iomap;
+    }
+    pci_set_drvdata(pdev, ptn_dev);
+    pci_set_master(pdev); /* XXX-ste: is needed??? */
+
+    ptn_dev->bars = bars;
+    mem_id = ioread16(ptn_dev->pci_io + PTNETMAP_IO_PCI_HOSTID);
+
+    /* create guest allocator */
+    ptn_dev->nm_mem = netmap_mem_pt_guest_attach(ptn_dev, mem_id);
+    if (ptn_dev->nm_mem == NULL) {
+        err = -ENOMEM;
+        goto err_nmd_attach;
+    }
+    netmap_mem_get(ptn_dev->nm_mem);
+
+    ND("ptn_memdev_driver mem_id: %d probe OK", mem_id);
+
+    return 0;
+
+err_nmd_attach:
+    pci_set_drvdata(pdev, NULL);
+    iounmap(ptn_dev->pci_io);
+err_iomap:
+    pci_release_selected_regions(pdev, bars);
+err_pci_reg:
+    pci_disable_device(pdev);
+err:
+    kfree(ptn_dev);
+    return err;
+}
+
+/*
+ * Device Removal Routine
+ */
+static void
+ptn_memdev_remove(struct pci_dev *pdev)
+{
+    struct ptnetmap_memdev *ptn_dev = pci_get_drvdata(pdev);
+
+    ND("ptn_memdev_driver remove");
+    if (ptn_dev->nm_mem) {
+        netmap_mem_put(ptn_dev->nm_mem);
+        ptn_dev->nm_mem = NULL;
+    }
+    if (ptn_dev->pci_mem) {
+        iounmap(ptn_dev->pci_mem);
+        ptn_dev->pci_mem = NULL;
+    }
+    pci_set_drvdata(pdev, NULL);
+    iounmap(ptn_dev->pci_io);
+    pci_release_selected_regions(pdev, ptn_dev->bars);
+    pci_disable_device(pdev);
+    kfree(ptn_dev);
+}
+
+/*
+ * pci driver information
+ */
+static struct pci_driver ptn_memdev_driver = {
+    .name       = PTN_MEMDEV_NAME,
+    .id_table   = ptn_memdev_ids,
+    .probe      = ptn_memdev_probe,
+    .remove     = ptn_memdev_remove,
+};
+
+/*
+ * Driver Registration Routine
+ *
+ * Returns 0 on success, negative on failure
+ */
+int
+nm_os_pt_memdev_init(void)
+{
+    int ret;
+
+    /* register pci driver */
+    ret = pci_register_driver(&ptn_memdev_driver);
+    if (ret < 0) {
+        D("ptn-driver register error");
+        return ret;
+    }
+    return 0;
+}
+
+/*
+ * Driver Exit Cleanup Routine
+ */
+void
+nm_os_pt_memdev_uninit(void)
+{
+    /* unregister pci driver */
+    pci_unregister_driver(&ptn_memdev_driver);
+
+    D("ptn_memdev_driver exit");
+}
+#else /* !WITH_PTNETMAP_GUEST */
+#define nm_os_pt_memdev_init()        0
+#define nm_os_pt_memdev_uninit()
+#endif /* WITH_PTNETMAP_GUEST */
+
 
 
 /* ########################## MODULE INIT ######################### */
@@ -1460,13 +2401,19 @@ struct miscdevice netmap_cdevsw = { /* same name as FreeBSD */
 
 static int linux_netmap_init(void)
 {
+        int err;
         /* Errors have negative values on linux. */
-	return -netmap_init();
+        err = -netmap_init();
+        if (err)
+            return err;
+
+	return nm_os_pt_memdev_init();
 }
 
 
 static void linux_netmap_fini(void)
 {
+        nm_os_pt_memdev_uninit();
         netmap_fini();
 }
 
@@ -1548,7 +2495,7 @@ linux_nm_vi_setup(struct ifnet *dev)
 }
 
 int
-nm_vi_persist(const char *name, struct ifnet **ret)
+nm_os_vi_persist(const char *name, struct ifnet **ret)
 {
 	struct ifnet *ifp;
 
@@ -1573,11 +2520,25 @@ nm_vi_persist(const char *name, struct ifnet **ret)
 }
 
 void
-nm_vi_detach(struct ifnet *ifp)
+nm_os_vi_detach(struct ifnet *ifp)
 {
 	netif_stop_queue(ifp);
 	unregister_netdev(ifp);
 	module_put(linux_dummy_drv.owner);
+}
+
+void
+nm_os_selwakeup(NM_SELINFO_T *si)
+{
+	/* We use wake_up_interruptible() since select() and poll()
+	 * sleep in an interruptbile way. */
+	wake_up_interruptible(si);
+}
+
+void
+nm_os_selrecord(NM_SELRECORD_T *sr, NM_SELINFO_T *si)
+{
+	poll_wait(sr->file, si, sr->pwait);
 }
 
 module_init(linux_netmap_init);
@@ -1585,9 +2546,12 @@ module_exit(linux_netmap_fini);
 
 /* export certain symbols to other modules */
 EXPORT_SYMBOL(netmap_attach);		/* driver attach routines */
+#ifdef WITH_PTNETMAP_GUEST
+EXPORT_SYMBOL(netmap_pt_guest_attach);	/* ptnetmap driver attach routines */
+EXPORT_SYMBOL(netmap_pt_guest_rxsync);	/* ptnetmap generic rxsync */
+EXPORT_SYMBOL(netmap_pt_guest_txsync);	/* ptnetmap generic txsync */
+#endif /* WITH_PTNETMAP_GUEST */
 EXPORT_SYMBOL(netmap_detach);		/* driver detach routines */
-EXPORT_SYMBOL(nm_txsync_prologue);	/* txsync support */
-EXPORT_SYMBOL(nm_rxsync_prologue);	/* rxsync support */
 EXPORT_SYMBOL(netmap_ring_reinit);	/* ring init on error */
 EXPORT_SYMBOL(netmap_reset);		/* ring init routines */
 EXPORT_SYMBOL(netmap_rx_irq);	        /* default irq handler */

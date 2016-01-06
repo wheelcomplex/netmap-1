@@ -34,6 +34,7 @@
 #include <bsd_glue.h>
 #include <net/netmap.h>
 #include <netmap/netmap_kern.h>
+#include <netmap/netmap_virt.h>
 
 #define SOFTC_T	e1000_adapter
 
@@ -53,7 +54,6 @@ e1000_netmap_reg(struct netmap_adapter *na, int onoff)
 	while (test_and_set_bit(__E1000_RESETTING, &adapter->flags))
 		usleep_range(1000, 2000);
 
-	rtnl_lock();
 	if (netif_running(adapter->netdev))
 		e1000_down(adapter);
 
@@ -68,11 +68,23 @@ e1000_netmap_reg(struct netmap_adapter *na, int onoff)
 	else
 		e1000_reset(adapter);
 
-	rtnl_unlock();
 	clear_bit(__E1000_RESETTING, &adapter->flags);
 	return (0);
 }
 
+static void e1000_irq_enable(struct e1000_adapter *adapter);
+static void e1000_irq_disable(struct e1000_adapter *adapter);
+static void
+e1000_netmap_intr(struct netmap_adapter *na, int onoff)
+{
+	struct ifnet *ifp = na->ifp;
+	struct SOFTC_T *adapter = netdev_priv(ifp);
+
+	if (onoff)
+		e1000_irq_enable(adapter);
+	else
+		e1000_irq_disable(adapter);
+}
 
 /*
  * Reconcile kernel and user view of the transmit ring.
@@ -160,7 +172,6 @@ e1000_netmap_txsync(struct netmap_kring *kring, int flags)
 		kring->nr_hwtail = nm_prev(netmap_idx_n2k(kring, nic_i), lim);
 	}
 out:
-	nm_txsync_finalize(kring);
 
 	return 0;
 }
@@ -180,7 +191,7 @@ e1000_netmap_rxsync(struct netmap_kring *kring, int flags)
 	u_int nic_i;	/* index into the NIC ring */
 	u_int n;
 	u_int const lim = kring->nkr_num_slots - 1;
-	u_int const head = nm_rxsync_prologue(kring);
+	u_int const head = kring->rhead;
 	int force_update = (flags & NAF_FORCE_READ) || kring->nr_kflags & NKR_PENDINTR;
 
 	/* device-specific */
@@ -257,8 +268,6 @@ e1000_netmap_rxsync(struct netmap_kring *kring, int flags)
 		writel(nic_i, adapter->hw.hw_addr + rxr->rdt);
 	}
 out:
-	/* tell userspace that there might be new packets */
-	nm_rxsync_finalize(kring);
 
 	return 0;
 
@@ -290,24 +299,20 @@ static int e1000_netmap_init_buffers(struct SOFTC_T *adapter)
 
 	if (!nm_native_on(na))
 		return 0;
+
 	adapter->alloc_rx_buf = e1000_no_rx_alloc;
 	for (r = 0; r < na->num_rx_rings; r++) {
 		struct e1000_rx_ring *rxr;
 		slot = netmap_reset(na, NR_RX, r, 0);
 		if (!slot) {
-			D("strange, null netmap ring %d", r);
-			return 0;
+			D("Skipping RX ring %d, netmap mode not requested", r);
+			continue;
 		}
 		rxr = &adapter->rx_ring[r];
 
 		for (i = 0; i < rxr->count; i++) {
-			// XXX the skb check and cleanup can go away
-			struct e1000_buffer *bi = &rxr->buffer_info[i];
 			si = netmap_idx_n2k(&na->rx_rings[r], i);
 			PNMB(na, slot + si, &paddr);
-			if (bi->skb)
-				D("rx buf %d was set", i);
-			bi->skb = NULL;
 			// netmap_load_map(...)
 			E1000_RX_DESC(*rxr, i)->buffer_addr = htole64(paddr);
 		}
@@ -321,17 +326,226 @@ static int e1000_netmap_init_buffers(struct SOFTC_T *adapter)
 		wmb(); /* Force memory writes to complete */
 		writel(i, hw->hw_addr + rxr->rdt);
 	}
+
 	/* now initialize the tx ring(s) */
-	slot = netmap_reset(na, NR_TX, 0, 0);
-	for (i = 0; i < na->num_tx_desc; i++) {
-		si = netmap_idx_n2k(&na->tx_rings[0], i);
-		PNMB(na, slot + si, &paddr);
-		// netmap_load_map(...)
-		E1000_TX_DESC(*txr, i)->buffer_addr = htole64(paddr);
+	for (r = 0; r < na->num_tx_rings; r++) {
+		slot = netmap_reset(na, NR_TX, r, 0);
+		if (!slot) {
+			D("Skipping TX ring %d, netmap mode not requested", r);
+			continue;
+		}
+
+		for (i = 0; i < na->num_tx_desc; i++) {
+			si = netmap_idx_n2k(&na->tx_rings[r], i);
+			PNMB(na, slot + si, &paddr);
+			// netmap_load_map(...)
+			E1000_TX_DESC(*txr, i)->buffer_addr = htole64(paddr);
+		}
 	}
+
 	return 1;
 }
 
+#if defined (CONFIG_E1000_NETMAP_PT) && defined (WITH_PTNETMAP_GUEST)
+/*
+ * ptnetmap support for: e1000 (linux version)
+ *
+ * For details on ptnetmap support please see virtio_netmap.h
+ */
+static uint32_t e1000_ptnetmap_ptctl(struct net_device *, uint32_t);
+
+/* Returns device configuration from the CSB */
+static int
+e1000_ptnetmap_config(struct netmap_adapter *na,
+		u_int *txr, u_int *txd, u_int *rxr, u_int *rxd)
+{
+	struct e1000_adapter *adapter = netdev_priv(na->ifp);
+	struct paravirt_csb *csb = adapter->csb;
+	int ret;
+
+	if (csb == NULL)
+		return EINVAL;
+
+	ret = e1000_ptnetmap_ptctl(na->ifp, NET_PARAVIRT_PTCTL_CONFIG);
+	if (ret)
+		return ret;
+
+	*txr = 1; //*txr = csb->num_tx_rings;
+	*rxr = 1; //*rxr = csb->num_rx_rings;
+	*txd = csb->num_tx_slots;
+	*rxd = csb->num_rx_slots;
+
+	D("txr %u rxr %u txd %u rxd %u",
+			*txr, *rxr, *txd, *rxd);
+	return 0;
+}
+
+/* Reconcile host and guest view of the transmit ring. */
+static int
+e1000_ptnetmap_txsync(struct netmap_kring *kring, int flags)
+{
+	struct netmap_adapter *na = kring->na;
+	//u_int ring_nr = kring->ring_id;
+	struct ifnet *ifp = na->ifp;
+	struct e1000_adapter *adapter = netdev_priv(ifp);
+	struct e1000_tx_ring* txr = &adapter->tx_ring[0];
+	int ret, notify = 0;
+
+        IFRATE(adapter->rate_ctx.new.tx_sync++);
+
+	ret = netmap_pt_guest_txsync(kring, flags, &notify);
+
+	if (notify)
+		writel(0, adapter->hw.hw_addr + txr->tdt);
+
+	return ret;
+}
+
+/* Reconcile host and guest view of the receive ring. */
+static int
+e1000_ptnetmap_rxsync(struct netmap_kring *kring, int flags)
+{
+	struct netmap_adapter *na = kring->na;
+	//u_int ring_nr = kring->ring_id;
+	struct ifnet *ifp = na->ifp;
+	struct e1000_adapter *adapter = netdev_priv(ifp);
+	struct e1000_hw *hw = &adapter->hw;
+	struct e1000_rx_ring *rxr = &adapter->rx_ring[0];
+	int ret, notify = 0;
+
+        IFRATE(adapter->rate_ctx.new.rx_sync++);
+
+	ret = netmap_pt_guest_rxsync(kring, flags, &notify);
+
+	if (notify)
+		writel(0, hw->hw_addr + rxr->rdt);
+
+	return ret;
+}
+
+/* Register/unregister. We are already under netmap lock. */
+static int
+e1000_ptnetmap_reg(struct netmap_adapter *na, int onoff)
+{
+	struct e1000_adapter *adapter = netdev_priv(na->ifp);
+	struct paravirt_csb *csb = adapter->csb;
+	struct netmap_kring *kring = NULL;
+	int ret = 0;
+
+	if (onoff) {
+		ret = e1000_ptnetmap_ptctl(na->ifp, NET_PARAVIRT_PTCTL_REGIF);
+		if (ret)
+			return ret;
+
+		/*
+		 * Init ring and kring pointers
+		 * After PARAVIRT_PTCTL_REGIF, the csb contains a snapshot of a
+		 * host kring pointers.
+		 * XXX This initialization is required, because we don't close
+		 * the host port on UNREGIF.
+		 */
+
+		/* init rx kring */
+		kring = na->rx_rings;
+		kring->rhead = kring->ring->head = csb->rx_ring.head;
+		kring->rcur = kring->ring->cur = csb->rx_ring.cur;
+		kring->nr_hwcur = csb->rx_ring.hwcur;
+		kring->nr_hwtail = kring->rtail = kring->ring->tail =
+			csb->rx_ring.hwtail;
+		/* Force modes on, independently of the user's request. */
+		kring->nr_pending_mode = kring->nr_mode = NKR_NETMAP_ON;
+
+		/* init tx kring */
+		kring = na->tx_rings;
+		kring->rhead = kring->ring->head = csb->tx_ring.head;
+		kring->rcur = kring->ring->cur = csb->tx_ring.cur;
+		kring->nr_hwcur = csb->tx_ring.hwcur;
+		kring->nr_hwtail = kring->rtail = kring->ring->tail =
+			csb->tx_ring.hwtail;
+		/* Force modes on, independently of the user's request. */
+		kring->nr_pending_mode = kring->nr_mode = NKR_NETMAP_ON;
+
+		adapter->ptnetmap_enabled = 1;
+		na->na_flags |= NAF_NETMAP_ON;
+
+	} else {
+		na->na_flags &= ~NAF_NETMAP_ON;
+		adapter->ptnetmap_enabled = 0;
+
+		/* Force modes off, independently of the user's request. */
+		kring = na->tx_rings;
+		kring->nr_pending_mode = kring->nr_mode = NKR_NETMAP_OFF;
+		kring = na->rx_rings;
+		kring->nr_pending_mode = kring->nr_mode = NKR_NETMAP_OFF;
+
+		ret = e1000_ptnetmap_ptctl(na->ifp, NET_PARAVIRT_PTCTL_UNREGIF);
+	}
+
+	return ret;
+}
+
+static int
+e1000_ptnetmap_bdg_attach(const char *bdg_name, struct netmap_adapter *na)
+{
+	return EOPNOTSUPP;
+}
+
+/*
+ * CSB (Communication Status Block) setup
+ * CSB is already allocated in e1000 (paravirt).
+ */
+static void
+e1000_ptnetmap_setup_csb(struct SOFTC_T *adapter)
+{
+	struct ifnet *ifp = adapter->netdev;
+	struct netmap_pt_guest_adapter* ptna =
+		(struct netmap_pt_guest_adapter *)NA(ifp);
+
+	ptna->csb = adapter->csb;
+}
+
+/* Send command to the host through PTCTL register. */
+static uint32_t
+e1000_ptnetmap_ptctl(struct net_device *netdev, uint32_t val)
+{
+	struct e1000_adapter *adapter = netdev_priv(netdev);
+	struct e1000_hw *hw = &adapter->hw;
+	uint32_t ret;
+
+	ew32(PTCTL, val);
+	ret = er32(PTSTS);
+	D("PTSTS = %u", ret);
+
+	return ret;
+}
+
+/* Features negotiation with the host through PTFEAT */
+static uint32_t
+e1000_ptnetmap_features(struct SOFTC_T *adapter)
+{
+	struct e1000_hw *hw = &adapter->hw;
+	struct net_device *netdev = adapter->netdev;
+	uint32_t features;
+	/* tell the device the features we support */
+	ew32(PTFEAT, NET_PTN_FEATURES_BASE); /* we are cheating for now */
+	/* get back the acknowledged features */
+	features = er32(PTFEAT);
+	pr_info("%s ptnetmap support: %s\n", netdev->name,
+			(features & NET_PTN_FEATURES_BASE) ? "base" :
+			"none");
+	return features;
+}
+
+static struct netmap_pt_guest_ops e1000_ptnetmap_ops = {
+	.nm_ptctl = e1000_ptnetmap_ptctl,
+};
+#elif defined (CONFIG_E1000_NETMAP_PT)
+#warning "e1000 supports ptnetmap but netmap does not support it"
+#warning "(configure netmap with ptnetmap support)"
+#elif defined (WITH_PTNETMAP_GUEST)
+#warning "netmap supports ptnetmap but e1000 does not support it"
+#warning "(configure e1000 with ptnetmap support)"
+#endif /* CONFIG_E1000_NETMAP_PT && WITH_PTNETMAP_GUEST */
 
 static void
 e1000_netmap_attach(struct SOFTC_T *adapter)
@@ -348,6 +562,22 @@ e1000_netmap_attach(struct SOFTC_T *adapter)
 	na.nm_txsync = e1000_netmap_txsync;
 	na.nm_rxsync = e1000_netmap_rxsync;
 	na.num_tx_rings = na.num_rx_rings = 1;
+	na.nm_intr = e1000_netmap_intr;
+
+#if defined (CONFIG_E1000_NETMAP_PT) && defined (WITH_PTNETMAP_GUEST)
+        /* XXX:check device ptnetmap support (now we use PARAVIRT_SUBDEV) */
+	if (paravirtual &&
+		(adapter->pdev->subsystem_device == E1000_PARAVIRT_SUBDEV) &&
+	        (e1000_ptnetmap_features(adapter) & NET_PTN_FEATURES_BASE)) {
+		na.nm_config = e1000_ptnetmap_config;
+		na.nm_register = e1000_ptnetmap_reg;
+		na.nm_txsync = e1000_ptnetmap_txsync;
+		na.nm_rxsync = e1000_ptnetmap_rxsync;
+		na.nm_bdg_attach = e1000_ptnetmap_bdg_attach; /* XXX */
+		netmap_pt_guest_attach(&na, &e1000_ptnetmap_ops);
+		e1000_ptnetmap_setup_csb(adapter);
+	} else
+#endif /* CONFIG_E1000_NETMAP_PT && WITH_PTNETMAP_GUEST */
 	netmap_attach(&na);
 }
 
